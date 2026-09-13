@@ -1,0 +1,19 @@
+node_modules
+.next
+
+# env files — never commit
+.env
+.env.local
+.env*.local
+.env.production
+
+# runtime state and logs
+data/
+logs/
+*.log
+
+# misc
+.DS_Store
+.vercel
+coverage
+*.bak
