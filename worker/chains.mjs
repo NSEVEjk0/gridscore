@@ -4,8 +4,11 @@ import { LIMITS } from "./env.mjs";
  * Public RPC data collection for one address on one chain.
  *
  * Everything here is plain JSON-RPC over HTTPS. No indexer, no API keys.
- * Per-chain timeout is 8s -> the chain reports Unknown, never a fake 0.
- * Transfer/Approval logs are capped at LIMITS.maxTxsPerChain entries.
+ * Each chain gets a total budget (default 8s) shared across all its calls;
+ * if the budget runs out — or every endpoint fails — the chain reports
+ * Unknown, never a fake 0. Each chain lists fallback endpoints and the
+ * caller tries them in order. Transfer/Approval logs are capped at
+ * LIMITS.maxTxsPerChain entries.
  */
 
 export const TRANSFER_TOPIC =
@@ -38,6 +41,29 @@ export async function rpcCall(url, method, params, timeoutMs = LIMITS.chainTimeo
   }
 }
 
+/**
+ * Call a JSON-RPC method against a list of endpoints, trying them in order
+ * until one answers. `deadline` is an absolute timestamp (Date.now()+budget):
+ * every attempt gets whatever budget is left, so the total stays bounded.
+ */
+export async function tryRpc(rpcs, method, params, deadline, perAttemptCapMs = 8000) {
+  let lastErr = new Error("no rpc endpoints");
+  for (const url of rpcs) {
+    const remaining = deadline - Date.now();
+    if (remaining < 200) throw new Error("rpc budget exhausted");
+    try {
+      return await rpcCall(url, method, params, Math.min(remaining, perAttemptCapMs));
+    } catch (err) {
+      lastErr = err;
+      if (err && err.name === "AbortError") {
+        // The budget was consumed by this endpoint; no point trying the next.
+        throw new Error("rpc budget exhausted");
+      }
+    }
+  }
+  throw lastErr;
+}
+
 function countToBucket(hexOrNumber) {
   const n = typeof hexOrNumber === "string" ? parseInt(hexOrNumber, 16) : Number(hexOrNumber || 0);
   return Number.isFinite(n) ? n : 0;
@@ -51,69 +77,95 @@ function weiToEther(hexOrNumber) {
   return Number(n) / 1e18;
 }
 
+const RANGE_ERR = /range|too large|too many|413|limit|maximum/i;
+const LOG_CHUNK_START = 2000;
+const LOG_CHUNK_MIN = 50;
+const MAX_LOG_CALLS = 90;
+
+function hexBlock(n) {
+  return "0x" + n.toString(16);
+}
+
 /**
- * Collect everything the 12 bars need for one chain.
- * Returns { status: "ok" | "unknown", ...data } — never throws.
+ * Walk eth_getLogs backward from the chain head in chunks. Public RPCs cap
+ * the block range per call (2048 on some chains, 50 on others), so the chunk
+ * size halves and retries when a range is rejected. The walk stops at the
+ * transaction cap, the call cap, or when the chain's time budget runs out —
+ * whichever comes first. Returns newest chunks first.
+ */
+async function fetchLogsBackward(rpc, deadline, headBlock, cap, padAddr) {
+  const sent = [];
+  const recv = [];
+  const approvals = [];
+  let chunk = LOG_CHUNK_START;
+  let to = headBlock;
+  let calls = 0;
+  let halvings = 0;
+
+  while (to > 0 && calls < MAX_LOG_CALLS && sent.length + recv.length < cap) {
+    if (deadline - Date.now() < 400) break;
+    const from = Math.max(0, to - chunk + 1);
+    const range = { fromBlock: hexBlock(from), toBlock: hexBlock(to) };
+    try {
+      const [s, r, a] = await Promise.all([
+        rpc("eth_getLogs", [
+          { ...range, topics: [TRANSFER_TOPIC, padAddr, null] },
+        ]),
+        rpc("eth_getLogs", [
+          { ...range, topics: [TRANSFER_TOPIC, null, padAddr] },
+        ]),
+        rpc("eth_getLogs", [
+          { ...range, topics: [APPROVAL_TOPIC, padAddr] },
+        ]),
+      ]);
+      calls += 3;
+      if (Array.isArray(s)) sent.push(...s);
+      if (Array.isArray(r)) recv.push(...r);
+      if (Array.isArray(a)) approvals.push(...a);
+      to = from - 1;
+    } catch (err) {
+      calls += 3;
+      const msg = String(err && err.message || err);
+      if (chunk > LOG_CHUNK_MIN && RANGE_ERR.test(msg) && halvings < 8) {
+        halvings += 1;
+        chunk = Math.max(LOG_CHUNK_MIN, Math.floor(chunk / 8));
+        continue; // retry the same range with a smaller chunk
+      }
+      break; // keep whatever was collected
+    }
+  }
+  return {
+    sent: sent.slice(0, cap),
+    recv: recv.slice(0, cap),
+    approvals: approvals.slice(0, cap),
+  };
+}
+
+/**
+ * Collect everything the 12 bars need for one chain, within one shared
+ * time budget. Returns { status: "ok" | "unknown", ...data } — never throws.
  */
 export async function scanChain(chain, address, opts = {}) {
-  const timeoutMs = opts.chainTimeoutMs || LIMITS.chainTimeoutMs;
+  const budgetMs = opts.chainTimeoutMs || LIMITS.chainTimeoutMs;
   const cap = opts.maxTxsPerChain || LIMITS.maxTxsPerChain;
-  const rpc = chain.rpc;
+  const rpcs = chain.rpcs || (chain.rpc ? [chain.rpc] : []);
+  const deadline = Date.now() + budgetMs;
+  const rpc = (method, params) => tryRpc(rpcs, method, params, deadline);
   const addr = address.toLowerCase();
+  const padAddr = padAddress(address);
 
   try {
-    // Baseline account state — all three in one Promise.all, sharing the timeout.
+    // Baseline account state — all at once, sharing the budget.
     const [nonce, balance, code, blockNumber] = await Promise.all([
-      rpcCall(rpc, "eth_getTransactionCount", [address, "latest"], timeoutMs),
-      rpcCall(rpc, "eth_getBalance", [address, "latest"], timeoutMs),
-      rpcCall(rpc, "eth_getCode", [address, "latest"], timeoutMs),
-      rpcCall(rpc, "eth_blockNumber", [], timeoutMs),
+      rpc("eth_getTransactionCount", [address, "latest"]),
+      rpc("eth_getBalance", [address, "latest"]),
+      rpc("eth_getCode", [address, "latest"]),
+      rpc("eth_blockNumber", []),
     ]);
 
     const headBlock = countToBucket(blockNumber);
-    // Look back up to ~200k blocks (roughly a month on most chains) for logs.
-    const fromBlock = Math.max(0, headBlock - 200_000);
-    const fromBlockHex = "0x" + fromBlock.toString(16);
-
-    // Token transfers involving the address, newest first, capped.
-    const [sentLogs, recvLogs, approvalLogs] = await Promise.all([
-      rpcCall(
-        rpc,
-        "eth_getLogs",
-        [
-          {
-            fromBlock: fromBlockHex,
-            toBlock: "latest",
-            topics: [TRANSFER_TOPIC, padAddress(address)],
-          },
-        ],
-        timeoutMs
-      ).then((ls) => (Array.isArray(ls) ? ls.slice(0, cap) : [])),
-      rpcCall(
-        rpc,
-        "eth_getLogs",
-        [
-          {
-            fromBlock: fromBlockHex,
-            toBlock: "latest",
-            topics: [TRANSFER_TOPIC, null, padAddress(address)],
-          },
-        ],
-        timeoutMs
-      ).then((ls) => (Array.isArray(ls) ? ls.slice(0, cap) : [])),
-      rpcCall(
-        rpc,
-        "eth_getLogs",
-        [
-          {
-            fromBlock: fromBlockHex,
-            toBlock: "latest",
-            topics: [APPROVAL_TOPIC, padAddress(address)],
-          },
-        ],
-        timeoutMs
-      ).then((ls) => (Array.isArray(ls) ? ls.slice(0, cap) : [])),
-    ]);
+    const { sent: sentLogs, recv: recvLogs, approvals: approvalLogs } =
+      await fetchLogsBackward(rpc, deadline, headBlock, cap, padAddr);
 
     // Timestamps for distinct blocks (capped to bound RPC calls).
     const blockNums = [
@@ -123,7 +175,7 @@ export async function scanChain(chain, address, opts = {}) {
     await Promise.all(
       blockNums.map(async (bn) => {
         try {
-          const block = await rpcCall(rpc, "eth_getBlockByNumber", [bn, false], timeoutMs);
+          const block = await rpc("eth_getBlockByNumber", [bn, false]);
           if (block && block.timestamp) timestamps[bn] = Number(block.timestamp) * 1000;
         } catch {
           // missing timestamp for one block is fine
@@ -182,7 +234,10 @@ export async function scanChain(chain, address, opts = {}) {
       chain: chain.key,
       chainName: chain.name,
       chainId: chain.chainId,
-      reason: err && err.name === "AbortError" ? "timeout" : String(err && err.message || err).slice(0, 120),
+      reason:
+        err && /budget/.test(String(err.message))
+          ? "timeout"
+          : String(err && err.message || err).slice(0, 120),
     };
   }
 }

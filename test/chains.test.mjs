@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import { scanChain, scanAllChains } from "../worker/chains.mjs";
+import { scanChain, scanAllChains, tryRpc } from "../worker/chains.mjs";
 
 const ADDR = "0x" + "9f".repeat(20);
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-const GOAT = { key: "goat", name: "GOAT", chainId: 2345, rpc: "https://goat.rpc.test" };
-const ETH = { key: "ethereum", name: "Ethereum", chainId: 1, rpc: "https://eth.rpc.test" };
+const GOAT = { key: "goat", name: "GOAT", chainId: 2345, rpcs: ["https://goat.rpc.test"] };
+const ETH = {
+  key: "ethereum",
+  name: "Ethereum",
+  chainId: 1,
+  rpcs: ["https://eth1.rpc.test", "https://eth2.rpc.test"],
+};
 
 function pad(addr) {
   return "0x000000000000000000000000" + addr.slice(2).toLowerCase();
@@ -55,6 +60,59 @@ function stubFetch() {
     })
   );
 }
+
+describe("tryRpc endpoint fallback", () => {
+  it("falls through to the next endpoint when the first fails", async () => {
+    const calls = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url) => {
+        calls.push(String(url));
+        if (String(url).includes("eth1")) {
+          return new Response("down", { status: 503 });
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      })
+    );
+    const out = await tryRpc(ETH.rpcs, "eth_blockNumber", [], Date.now() + 5000);
+    expect(out).toBe("0x1");
+    expect(calls).toEqual(["https://eth1.rpc.test", "https://eth2.rpc.test"]);
+  });
+
+  it("gives up when every endpoint fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("down", { status: 503 }))
+    );
+    await expect(
+      tryRpc(ETH.rpcs, "eth_blockNumber", [], Date.now() + 5000)
+    ).rejects.toThrow();
+  });
+
+  it("respects the deadline and stops trying further endpoints", async () => {
+    const calls = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (url, init) =>
+          new Promise((_resolve, reject) => {
+            calls.push(String(url));
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("This operation was aborted", "AbortError"))
+            );
+          })
+      )
+    );
+    await expect(
+      tryRpc(ETH.rpcs, "eth_blockNumber", [], Date.now() + 400)
+    ).rejects.toThrow();
+    // budget exhausted by the first hanging endpoint — no second call
+    expect(calls).toEqual(["https://eth1.rpc.test"]);
+  });
+});
 
 describe("scanChain", () => {
   it("collects account state and caps transfer logs at the limit", async () => {

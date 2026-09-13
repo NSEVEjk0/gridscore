@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import { handler, store } from "../worker/worker.mjs";
+import { handler, pickOrderForPayment, store } from "../worker/worker.mjs";
 
 /**
  * End-to-end order lifecycle through the worker's HTTP handler with every
@@ -196,6 +196,26 @@ describe("order lifecycle", () => {
   it("unknown order returns 404", async () => {
     const res = await call("GET", "/order/does_not_exist");
     expect(res.statusCode).toBe(404);
+  });
+
+  it("an incoming payment attaches to the newest unpaid order", () => {
+    const mk = (id, createdAgoMs, status = "awaiting_payment") => ({
+      id,
+      createdAt: new Date(Date.now() - createdAgoMs).toISOString(),
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      status,
+      payment: { startBlock: 100 },
+    });
+    const oldest = mk("old", 60 * 60 * 1000);
+    const newest = mk("new", 30 * 1000);
+    const expired = mk("exp", 3 * 60 * 60 * 1000);
+    expired.expiresAt = new Date(Date.now() - 1000).toISOString();
+    const paid = mk("paid", 5 * 1000, "done");
+
+    expect(pickOrderForPayment([oldest, newest])).toBe(newest);
+    expect(pickOrderForPayment([oldest])).toBe(oldest);
+    expect(pickOrderForPayment([expired, paid])).toBeNull();
+    expect(pickOrderForPayment([])).toBeNull();
   });
 
   it("health endpoint reports the payment setup", async () => {

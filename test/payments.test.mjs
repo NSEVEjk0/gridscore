@@ -39,7 +39,7 @@ function rpcResponds(result) {
     });
 }
 
-const RPC = "https://goat.rpc.test";
+const RPCS = ["https://goat.rpc.test"];
 const ORDER = { payment: { startBlock: 500 } };
 
 beforeEach(() => {
@@ -66,7 +66,7 @@ describe("challenge", () => {
 
 describe("verifyTxHash", () => {
   it("accepts a matching successful USDC transfer", async () => {
-    const v = await verifyTxHash("0x" + "c".repeat(64), ORDER, RPC);
+    const v = await verifyTxHash("0x" + "c".repeat(64), ORDER, RPCS);
     expect(v.ok).toBe(true);
     expect(v.from).toBe(PAYER);
     expect(v.amount).toBe("750000");
@@ -75,26 +75,26 @@ describe("verifyTxHash", () => {
   it("accepts overpayment but rejects underpayment", async () => {
     // overpayment
     globalThis.fetch = rpcResponds(receipt({ value: "1000000" }));
-    const v1 = await verifyTxHash("0x" + "c".repeat(64), ORDER, RPC);
+    const v1 = await verifyTxHash("0x" + "c".repeat(64), ORDER, RPCS);
     expect(v1.ok).toBe(true);
     // underpayment
     globalThis.fetch = rpcResponds(receipt({ value: "700000" }));
-    const v2 = await verifyTxHash("0x" + "c".repeat(64), ORDER, RPC);
+    const v2 = await verifyTxHash("0x" + "c".repeat(64), ORDER, RPCS);
     expect(v2.ok).toBe(false);
   });
 
   it("rejects the wrong recipient, wrong token, failed tx, and stale payments", async () => {
     // wrong recipient
     globalThis.fetch = rpcResponds(receipt({ to: OTHER }));
-    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPC)).ok).toBe(false);
+    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPCS)).ok).toBe(false);
     // wrong token
     globalThis.fetch = rpcResponds(receipt({ token: OTHER }));
-    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPC)).ok).toBe(false);
+    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPCS)).ok).toBe(false);
     // reverted tx
     globalThis.fetch = rpcResponds(receipt({ status: "0x0" }));
-    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPC)).ok).toBe(false);
+    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPCS)).ok).toBe(false);
     // mined before the order existed
     globalThis.fetch = rpcResponds(receipt({ block: 100 }));
-    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPC)).ok).toBe(false);
+    expect((await verifyTxHash("0x" + "c".repeat(64), ORDER, RPCS)).ok).toBe(false);
   });
 });

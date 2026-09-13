@@ -1,6 +1,14 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// next/font is a build-time macro; stub it for rendering the layout here.
+vi.mock("next/font/google", () => ({
+  Newsreader: () => ({ variable: "--font-display" }),
+  Inter: () => ({ variable: "--font-sans" }),
+  JetBrains_Mono: () => ({ variable: "--font-mono" }),
+}));
+
 import RootLayout from "@/app/layout";
 
 const X_URL = "https://x.com/CRYPTFRANI";

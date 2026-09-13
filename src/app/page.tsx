@@ -5,6 +5,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const TXHASH_RE = /^0x[0-9a-fA-F]{64}$/;
 const COUNTDOWN_SECONDS = 60;
+const ORDER_KEY = "gridscore:orderId";
+
+const CHAIN_NAMES = [
+  "GOAT", "Ethereum", "Base", "Arbitrum",
+  "Optimism", "Polygon", "BNB", "Avalanche",
+];
 
 interface BarEntry {
   key: string;
@@ -50,6 +56,7 @@ interface Order {
   payment?: { paidAt: string | null; txHash: string | null } | null;
   report?: {
     overall: number | string;
+    meta?: { chainsReachable?: number; unknownChains?: string[] };
     barList: BarEntry[];
     verdict: { verdict: string; reasons: string[]; notChecked: string[]; source: string };
     agent: { erc8004: { agentRegistry: string; agentId: string } };
@@ -57,45 +64,61 @@ interface Order {
   } | null;
 }
 
+type Phase = "idle" | "loading" | "pay" | "scan" | "done";
+
 export default function HomePage() {
-  const [phase, setPhase] = useState<"idle" | "pay" | "scan" | "done">("idle");
+  const [phase, setPhase] = useState<Phase>("loading");
   const [order, setOrder] = useState<Order | null>(null);
   const [address, setAddress] = useState("");
   const [txHash, setTxHash] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState(COUNTDOWN_SECONDS);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const resumeTried = useRef(false);
 
-  const stopTimers = useCallback(() => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    if (countdownRef.current) clearInterval(countdownRef.current);
-    pollRef.current = null;
-    countdownRef.current = null;
+  // ---- Resume the last order after a refresh or a return visit ----
+  useEffect(() => {
+    if (resumeTried.current) return;
+    resumeTried.current = true;
+    const saved = typeof window !== "undefined" ? localStorage.getItem(ORDER_KEY) : null;
+    if (!saved) {
+      setPhase("idle");
+      return;
+    }
+    fetch(`/api/order/${saved}`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((o) => {
+        if (!o) {
+          localStorage.removeItem(ORDER_KEY);
+          setPhase("idle");
+          return;
+        }
+        setOrder(o);
+        if (o.status === "awaiting_payment") setPhase("pay");
+        else if (o.status === "scanning") setPhase("scan");
+        else if (o.status === "done" && o.report) setPhase("done");
+        else {
+          localStorage.removeItem(ORDER_KEY);
+          setPhase("idle");
+        }
+      })
+      .catch(() => setPhase("idle"));
   }, []);
 
-  useEffect(() => stopTimers, [stopTimers]);
+  const applyOrder = useCallback((o: Order) => {
+    setOrder(o);
+    if (typeof window !== "undefined") localStorage.setItem(ORDER_KEY, o.orderId);
+    if (o.status === "awaiting_payment") setPhase("pay");
+    if (o.status === "scanning") setPhase("scan");
+    if (o.status === "done" && o.report) setPhase("done");
+    if (o.status === "expired") {
+      localStorage.removeItem(ORDER_KEY);
+      setError("That order expired unpaid. Start a new scan below.");
+      setPhase("idle");
+    }
+  }, []);
 
-  const applyOrder = useCallback(
-    (o: Order) => {
-      setOrder(o);
-      if (o.status === "awaiting_payment") setPhase("pay");
-      if (o.status === "scanning") setPhase("scan");
-      if (o.status === "done" && o.report) {
-        stopTimers();
-        setPhase("done");
-      }
-      if (o.status === "expired") {
-        stopTimers();
-        setError("This order expired unpaid. Start a new scan.");
-        setPhase("idle");
-      }
-    },
-    [stopTimers]
-  );
-
-  // Poll order status while paying or scanning.
+  // ---- Poll while paying or scanning ----
   useEffect(() => {
     if ((phase !== "pay" && phase !== "scan") || !order) return;
     const id = setInterval(async () => {
@@ -106,19 +129,17 @@ export default function HomePage() {
       } catch {
         // transient; keep polling
       }
-    }, 2500);
-    pollRef.current = id;
+    }, 2200);
     return () => clearInterval(id);
   }, [phase, order?.orderId, applyOrder, order]);
 
-  // 1-minute countdown while scanning; stops the moment the report lands.
+  // ---- 1-minute countdown while scanning; stops the moment the report lands ----
   useEffect(() => {
     if (phase !== "scan") return;
     setCountdown(COUNTDOWN_SECONDS);
     const id = setInterval(() => {
       setCountdown((c) => (c <= 1 ? 0 : c - 1));
     }, 1000);
-    countdownRef.current = id;
     return () => clearInterval(id);
   }, [phase]);
 
@@ -142,8 +163,8 @@ export default function HomePage() {
         setError(body?.error || `Could not start the order (${res.status}).`);
         return;
       }
-      setPhase("pay");
-      setOrder(body);
+      setTxHash("");
+      applyOrder(body);
     } catch {
       setError("Network error while starting the order.");
     } finally {
@@ -184,7 +205,7 @@ export default function HomePage() {
   }
 
   function restart() {
-    stopTimers();
+    if (typeof window !== "undefined") localStorage.removeItem(ORDER_KEY);
     setPhase("idle");
     setOrder(null);
     setAddress("");
@@ -196,16 +217,22 @@ export default function HomePage() {
 
   return (
     <div>
+      {phase === "loading" ? (
+        <div style={{ height: "40vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <span className="hint">Loading…</span>
+        </div>
+      ) : null}
+
       {phase === "idle" ? (
         <>
           <p className="kicker">Address screening</p>
           <h1>
-            Check an address before you send funds or approve a contract.
+            Know an address before you send funds or approve a contract.
           </h1>
           <p className="lead">
-            Gridscore reads public chain data on eight networks, scores 12 bars
-            with fixed rules, and gives one agent verdict. One scan costs $0.75
-            USDC, paid on GOAT Network.
+            Gridscore reads public chain data on eight networks, scores twelve
+            bars with fixed rules, and gives one agent verdict. One scan costs
+            $0.75 USDC, paid on GOAT Network.
           </p>
           <form className="card" onSubmit={startScan}>
             <label htmlFor="address">Wallet address</label>
@@ -225,51 +252,66 @@ export default function HomePage() {
             {error ? <p className="error" role="alert">{error}</p> : null}
             <p className="hint">
               You will get a payment step on GOAT Network before any data is
-              collected. No report is produced until the payment is confirmed
-              on-chain.
+              collected. Nothing is scanned and no report exists until the
+              payment is confirmed on-chain.
             </p>
           </form>
+          <div className="card" style={{ paddingTop: 20 }}>
+            <div className="chain-list" style={{ justifyContent: "flex-start" }}>
+              {CHAIN_NAMES.map((c, i) => (
+                <span key={c} className="chain-chip" style={{ animationDelay: `${i * 60}ms` }}>
+                  {c}
+                </span>
+              ))}
+            </div>
+            <p className="hint" style={{ marginTop: 14 }}>
+              Read in parallel from public RPCs. Chains that do not answer in
+              time show as Unknown — never a made-up score.
+            </p>
+          </div>
         </>
       ) : null}
 
       {phase === "pay" && order && accept ? (
         <>
           <p className="step-tag">Step 2 · Pay on GOAT</p>
-          <h1>Send {accept.amountHuman} {accept.tokenSymbol} on GOAT Network</h1>
+          <h1>Send the payment</h1>
           <p className="lead">
-            One payment, one report. Send the transfer from any wallet you
-            like — Gridscore watches the GOAT chain and starts the scan the
-            moment the transfer lands.
+            One payment, one report. Send the transfer from any wallet — this
+            page confirms by itself, usually within seconds of the transfer
+            landing on GOAT.
           </p>
           <div className="card">
-            <label>Amount</label>
-            <div className="kv">
-              <div>
-                <div className="k">Amount</div>
-                <div className="v mono">{accept.amountHuman} {accept.tokenSymbol}</div>
-              </div>
-              <div>
-                <div className="k">Network</div>
-                <div className="v">{accept.networkName} (chain {accept.chainId})</div>
-              </div>
+            <div className="pay-amount">
+              {accept.amountHuman} <small>{accept.tokenSymbol}</small>
             </div>
-            <label>Send to</label>
+            <p className="hint" style={{ marginTop: 0 }}>
+              on {accept.networkName} (chain {accept.chainId})
+            </p>
+
+            <label>Send to this address</label>
             <div className="copy-row">
-              <input className="mono" readOnly value={accept.payTo} />
+              <div className="pay-address" style={{ flex: 1 }}>{accept.payTo}</div>
               <button type="button" className="btn-ghost" onClick={() => copy(accept.payTo)}>
                 Copy
               </button>
             </div>
             <p className="hint">
-              USDC transfer, ordinary ERC-20 send. Nothing else is needed — no
-              signature, no approval.
+              An ordinary USDC transfer — no signature, no approval. If your
+              wallet offers several USDC contracts on GOAT, the largest one
+              (bridged USDC) is the right one.
             </p>
-            <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 18 }}>
-              <span className="spinner" />
-              <span className="scan-note">Watching the GOAT chain for your payment…</span>
+
+            <div style={{ marginTop: 22 }}>
+              <span className="pill"><span className="dot" /> Watching the GOAT chain for your payment</span>
             </div>
+            <p className="hint">
+              Keep this page open — your order is remembered on this device
+              even if you refresh or close the tab.
+            </p>
+
             <form onSubmit={claimPayment}>
-              <label htmlFor="txhash">Already paid? Paste your GOAT transaction hash</label>
+              <label htmlFor="txhash">Already sent? Confirm with your transaction hash</label>
               <div className="copy-row">
                 <input
                   id="txhash"
@@ -280,15 +322,15 @@ export default function HomePage() {
                   spellCheck={false}
                 />
                 <button type="submit" disabled={busy}>
-                  {busy ? "Checking…" : "Check payment"}
+                  {busy ? "Checking…" : "Confirm"}
                 </button>
               </div>
             </form>
             {error ? <p className="error" role="alert">{error}</p> : null}
             <p className="hint">
-              Prefer to pay later? The order stays open for two hours.{" "}
+              The order stays open for two hours.{" "}
               <a href="#" onClick={(e) => { e.preventDefault(); restart(); }} style={{ color: "var(--accent)" }}>
-                Cancel
+                Start over
               </a>
             </p>
           </div>
@@ -300,18 +342,33 @@ export default function HomePage() {
           <p className="step-tag">Step 3 · Scanning</p>
           <h1>Reading the chains</h1>
           <p className="lead mono" style={{ wordBreak: "break-all" }}>{order.address}</p>
-          <div className="card" style={{ textAlign: "center", padding: "36px 22px" }}>
-            <div className="countdown">{countdown}s</div>
-            <p className="scan-note">
-              Payment confirmed. The agent is reading GOAT, Ethereum, Base,
-              Arbitrum, Optimism, Polygon, BNB and Avalanche. The report appears
-              the moment it is ready — at most within a minute.
-            </p>
+          <div className="card" style={{ textAlign: "center", padding: "40px 24px" }}>
+            <div className="countdown-row">
+              <span className="countdown">{countdown}s</span>
+              <span className="hint" style={{ margin: 0 }}>at most</span>
+            </div>
+            <div className="progress-track">
+              <div
+                className="progress-fill"
+                style={{ width: `${((COUNTDOWN_SECONDS - countdown) / COUNTDOWN_SECONDS) * 100}%` }}
+              />
+            </div>
+            <div className="chain-list">
+              {CHAIN_NAMES.map((c, i) => (
+                <span key={c} className="chain-chip" style={{ animationDelay: `${i * 90}ms` }}>
+                  {c}
+                </span>
+              ))}
+            </div>
             {order.payment?.txHash ? (
-              <p className="paid-tag mono" style={{ wordBreak: "break-all" }}>
-                GOAT payment tx: {order.payment.txHash}
+              <p className="paid-tag mono">
+                GOAT payment confirmed · tx {order.payment.txHash.slice(0, 14)}…
+                {order.payment.txHash.slice(-8)}
               </p>
             ) : null}
+            <p className="hint" style={{ marginTop: 16 }}>
+              The report appears here the moment it is ready.
+            </p>
           </div>
         </>
       ) : null}
@@ -326,6 +383,11 @@ export default function HomePage() {
 function Report({ order, onRestart }: { order: Order; onRestart: () => void }) {
   const r = order.report!;
   const overall = typeof r.overall === "number" ? r.overall : null;
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setMounted(true), 60);
+    return () => clearTimeout(t);
+  }, []);
 
   return (
     <>
@@ -336,13 +398,13 @@ function Report({ order, onRestart }: { order: Order; onRestart: () => void }) {
           {r.verdict.verdict}
         </div>
         <div className="verdict-source">
-          Written from the 12 bars below — {r.verdict.source === "model" ? "composed by the agent" : "composed by rule"}
+          Written from the twelve bars below — {r.verdict.source === "model" ? "composed by the agent" : "composed by rule"}
         </div>
         <div className="overall-line">
           <span className="verdict-label" style={{ margin: 0 }}>Overall</span>
           <span className="overall-num">{overall ?? "—"}</span>
           <span className="hint" style={{ margin: 0 }}>
-            average of the {overall !== null ? "scored" : ""} bars (Unknown and N/A excluded)
+            average of the scored bars (Unknown and N/A excluded)
           </span>
         </div>
       </div>
@@ -363,20 +425,24 @@ function Report({ order, onRestart }: { order: Order; onRestart: () => void }) {
       </div>
 
       <div className="card">
-        <h2>The 12 bars</h2>
+        <h2>The twelve bars</h2>
         <div className="bars">
-          {r.barList.map((b) => (
-            <div className="bar-row" key={b.key}>
+          {r.barList.map((b, i) => (
+            <div className="bar-row" key={b.key} style={{ animationDelay: `${i * 40}ms` }}>
               <div className="bar-head">
                 <span className="name">{BAR_LABELS[b.key] || b.key}</span>
                 <span className="val">
-                  {typeof b.score === "number" ? `${b.score}/100` : b.score === "unknown" ? "Unknown" : "N/A"}
+                  {typeof b.score === "number"
+                    ? `${b.score}/100`
+                    : b.score === "unknown"
+                      ? "Unknown"
+                      : "N/A"}
                 </span>
               </div>
               <div className="bar-track">
                 <div
-                  className={`bar-fill ${fillClass(b.score)}`}
-                  style={{ width: typeof b.score === "number" ? `${b.score}%` : "0%" }}
+                  className={`bar-fill ${fillClass(b.score)} ${mounted ? "on" : ""}`}
+                  style={{ "--w": typeof b.score === "number" ? `${b.score}%` : "0%" } as React.CSSProperties}
                 />
               </div>
               <div className="bar-note">{b.note}</div>
@@ -417,7 +483,7 @@ function Report({ order, onRestart }: { order: Order; onRestart: () => void }) {
             <div className="v mono">{r.agent.erc8004.agentId}</div>
           </div>
         </div>
-        <p className="hint" style={{ marginTop: 14 }}>
+        <p className="hint" style={{ marginTop: 16 }}>
           Public chain data only. Not financial advice.{" "}
           <a href="#" onClick={(e) => { e.preventDefault(); onRestart(); }} style={{ color: "var(--accent)" }}>
             Scan another address

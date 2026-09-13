@@ -1,5 +1,20 @@
 import type { Metadata } from "next";
+import { Newsreader, Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
+
+const display = Newsreader({
+  subsets: ["latin"],
+  style: ["normal", "italic"],
+  variable: "--font-display",
+});
+
+const sans = Inter({ subsets: ["latin"], variable: "--font-sans" });
+
+const mono = JetBrains_Mono({
+  subsets: ["latin"],
+  weight: ["400", "500"],
+  variable: "--font-mono",
+});
 
 export const metadata: Metadata = {
   title: "Gridscore — address screening, paid per scan",
@@ -15,12 +30,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" className={`${display.variable} ${sans.variable} ${mono.variable}`}>
       <body>
         <div className="wrap">
           <header className="site-header">
             <a className="wordmark" href="/">
-              Grid<span>score</span>
+              Gridscore
             </a>
             <nav>
               <a href={X_URL} target="_blank" rel="noreferrer">

@@ -1,5 +1,5 @@
 import { PAY, priceInUnits } from "./env.mjs";
-import { TRANSFER_TOPIC, rpcCall } from "./chains.mjs";
+import { TRANSFER_TOPIC, tryRpc } from "./chains.mjs";
 
 /**
  * GOAT Network payment rails, x402-style: the order API answers with a 402
@@ -58,14 +58,10 @@ function parseTransferLog(log) {
  * Verify a claimed GOAT tx hash pays this order: a USDC transfer of at
  * least the price, to payTo, mined at or after the order was created.
  */
-export async function verifyTxHash(txHash, order, rpcUrl, opts = {}) {
+export async function verifyTxHash(txHash, order, rpcs, opts = {}) {
   const timeoutMs = opts.chainTimeoutMs;
-  const receipt = await rpcCall(
-    rpcUrl,
-    "eth_getTransactionReceipt",
-    [txHash],
-    timeoutMs
-  );
+  const deadline = Date.now() + timeoutMs;
+  const receipt = await tryRpc(rpcs, "eth_getTransactionReceipt", [txHash], deadline);
   if (!receipt || receipt.status !== "0x1") return { ok: false, reason: "not a successful transaction" };
 
   const need = BigInt(priceInUnits());
@@ -95,11 +91,12 @@ export async function verifyTxHash(txHash, order, rpcUrl, opts = {}) {
  * Look for any unclaimed incoming USDC payment to payTo since the order's
  * start block. Returns the first matching tx hash or null.
  */
-export async function detectPayment(order, rpcUrl, usedTxHashes, opts = {}) {
+export async function detectPayment(order, rpcs, usedTxHashes, opts = {}) {
   if (!order.payment?.startBlock) return null;
   const fromBlock = "0x" + order.payment.startBlock.toString(16);
-  const logs = await rpcCall(
-    rpcUrl,
+  const deadline = Date.now() + (opts.chainTimeoutMs || 8000);
+  const logs = await tryRpc(
+    rpcs,
     "eth_getLogs",
     [
       {
@@ -109,7 +106,7 @@ export async function detectPayment(order, rpcUrl, usedTxHashes, opts = {}) {
         topics: [TRANSFER_TOPIC, null, padAddress(PAY.payTo)],
       },
     ],
-    opts.chainTimeoutMs
+    deadline
   );
   if (!Array.isArray(logs)) return null;
   const need = BigInt(priceInUnits());

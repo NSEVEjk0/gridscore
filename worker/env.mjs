@@ -12,16 +12,53 @@ const env = (name, fallback) => {
   return v === undefined || v === "" ? fallback : v;
 };
 
+/**
+ * Each chain lists several public RPC endpoints; the scanner tries them in
+ * order until one answers. Set GRIDSCORE_RPC_<KEY> to force a specific one.
+ */
+function chain(key, name, chainId, defaults) {
+  const override = process.env[`GRIDSCORE_RPC_${key.toUpperCase()}`];
+  return { key, name, chainId, rpcs: override ? [override, ...defaults] : defaults };
+}
+
 export const CHAINS = [
-  { key: "goat", name: "GOAT", chainId: 2345, rpc: env("GRIDSCORE_RPC_GOAT", "https://rpc.goat.network") },
-  { key: "ethereum", name: "Ethereum", chainId: 1, rpc: env("GRIDSCORE_RPC_ETHEREUM", "https://eth.llamarpc.com") },
-  { key: "base", name: "Base", chainId: 8453, rpc: env("GRIDSCORE_RPC_BASE", "https://mainnet.base.org") },
-  { key: "arbitrum", name: "Arbitrum", chainId: 42161, rpc: env("GRIDSCORE_RPC_ARBITRUM", "https://arb1.arbitrum.io/rpc") },
-  { key: "optimism", name: "Optimism", chainId: 10, rpc: env("GRIDSCORE_RPC_OPTIMISM", "https://mainnet.optimism.io") },
-  { key: "polygon", name: "Polygon", chainId: 137, rpc: env("GRIDSCORE_RPC_POLYGON", "https://polygon-rpc.com") },
-  { key: "bnb", name: "BNB", chainId: 56, rpc: env("GRIDSCORE_RPC_BNB", "https://bsc-dataseed.binance.org") },
-  { key: "avalanche", name: "Avalanche", chainId: 43114, rpc: env("GRIDSCORE_RPC_AVALANCHE", "https://api.avax.network/ext/bc/C/rpc") },
+  chain("goat", "GOAT", 2345, [
+    "https://rpc.goat.network",
+    "https://rpc.ankr.com/goat_mainnet",
+  ]),
+  chain("ethereum", "Ethereum", 1, [
+    "https://ethereum-rpc.publicnode.com",
+    "https://cloudflare-eth.com",
+  ]),
+  chain("base", "Base", 8453, [
+    "https://base-rpc.publicnode.com",
+    "https://mainnet.base.org",
+  ]),
+  chain("arbitrum", "Arbitrum", 42161, [
+    "https://arbitrum-one-rpc.publicnode.com",
+    "https://arb1.arbitrum.io/rpc",
+  ]),
+  chain("optimism", "Optimism", 10, [
+    "https://optimism-rpc.publicnode.com",
+    "https://mainnet.optimism.io",
+  ]),
+  chain("polygon", "Polygon", 137, [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+  ]),
+  chain("bnb", "BNB", 56, [
+    "https://bsc-rpc.publicnode.com",
+    "https://bsc-dataseed.binance.org",
+  ]),
+  chain("avalanche", "Avalanche", 43114, [
+    "https://avalanche-c-chain-rpc.publicnode.com",
+    "https://api.avax.network/ext/bc/C/rpc",
+  ]),
 ];
+
+export function goatRpcs() {
+  return CHAINS.find((c) => c.key === "goat").rpcs;
+}
 
 // GOAT Network payment rails (x402-style ERC20 direct transfer).
 export const PAY = {
@@ -39,6 +76,7 @@ export const LIMITS = {
   jobHardCapMs: Number(env("GRIDSCORE_JOB_HARD_CAP_MS", "50000")),
   maxTxsPerChain: Number(env("GRIDSCORE_MAX_TXS_PER_CHAIN", "200")),
   maxChainConcurrency: Number(env("GRIDSCORE_MAX_CHAIN_CONCURRENCY", "8")),
+  watchPollMs: Number(env("GRIDSCORE_WATCH_POLL_MS", "2500")),
 };
 
 // Optional verdict provider (OpenAI-compatible chat completions endpoint).
@@ -61,6 +99,7 @@ export const AGENT = {
 };
 
 export const WORKER_PORT = Number(env("GRIDSCORE_PORT", "8787"));
+export const WORKER_BIND = env("GRIDSCORE_BIND", "0.0.0.0");
 
 export function priceInUnits() {
   // $0.75 at 6 decimals -> "750000". Computed, never hardcoded.

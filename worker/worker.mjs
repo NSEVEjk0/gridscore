@@ -1,6 +1,6 @@
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { AGENT, CHAINS, LIMITS, PAY, WORKER_PORT } from "./env.mjs";
+import { AGENT, CHAINS, LIMITS, PAY, WORKER_BIND, WORKER_PORT, goatRpcs } from "./env.mjs";
 import { rpcCall, scanAllChains } from "./chains.mjs";
 import { computeBars } from "./score.mjs";
 import { agentVerdict, templateVerdict } from "./verdict.mjs";
@@ -16,12 +16,16 @@ import { Store, newOrderId } from "./state.mjs";
  *                        (hard-capped at LIMITS.jobHardCapMs = 50s)
  *   done              -> report published (ready chains; the rest Unknown)
  *
+ * A detected payment attaches to the NEWEST unpaid order — the one the
+ * buyer's browser is most likely watching. The claim endpoint binds a
+ * transaction hash to one specific order explicitly. Either way, each
+ * transaction hash pays for exactly one scan.
+ *
  * The whole job (RPCs + verdict + save) never exceeds the hard cap:
  * unfinished chains are published as Unknown.
  */
 
 const ORDER_TTL_MS = 2 * 60 * 60 * 1000; // unpaid orders expire after 2h
-const WATCH_POLL_MS = 4000;
 
 const store = new Store();
 const log = (event, data = {}) =>
@@ -30,17 +34,17 @@ const log = (event, data = {}) =>
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const TXHASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
-function goatRpc() {
-  return CHAINS.find((c) => c.key === "goat").rpc;
-}
-
 async function currentGoatBlock() {
-  try {
-    const n = await rpcCall(goatRpc(), "eth_blockNumber", [], LIMITS.chainTimeoutMs);
-    return parseInt(n, 16);
-  } catch {
-    return null;
+  const deadline = Date.now() + LIMITS.chainTimeoutMs;
+  for (const url of goatRpcs()) {
+    try {
+      const n = await rpcCall(url, "eth_blockNumber", [], Math.max(500, deadline - Date.now()));
+      return parseInt(n, 16);
+    } catch {
+      // try the next endpoint
+    }
   }
+  return null;
 }
 
 async function createOrder(address) {
@@ -68,6 +72,17 @@ async function createOrder(address) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Which unpaid order should an incoming payment attach to? The newest one —
+ * the page the buyer most likely has open right now.
+ */
+export function pickOrderForPayment(orders) {
+  const unpaid = orders
+    .filter((o) => o.status === "awaiting_payment" && Date.now() < Date.parse(o.expiresAt))
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  return unpaid[0] || null;
+}
+
 /** Fill in Unknown entries for chains that did not finish in time. */
 function normalizeChainResults(results) {
   const byKey = new Map(results.map((r) => [r.chain, r]));
@@ -83,7 +98,7 @@ function normalizeChainResults(results) {
   );
 }
 
-async function runScan(order) {
+export async function runScan(order) {
   const deadline = Date.now() + LIMITS.jobHardCapMs;
   order.status = "scanning";
   order.scan = { startedAt: new Date().toISOString() };
@@ -185,27 +200,27 @@ async function markPaid(order, { txHash, from, amountUnits }) {
 // ---- Payment watcher: poll GOAT for incoming USDC on unpaid orders ----
 async function watchPayments() {
   for (;;) {
-    const unpaid = [...store.orders.values()].filter(
-      (o) => o.status === "awaiting_payment" && Date.now() < Date.parse(o.expiresAt)
-    );
-    for (const order of unpaid) {
+    const target = pickOrderForPayment([...store.orders.values()]);
+    if (target) {
       try {
-        const txHash = await detectPayment(order, goatRpc(), store.usedTxHashes, {
+        const txHash = await detectPayment(target, goatRpcs(), store.usedTxHashes, {
           chainTimeoutMs: LIMITS.chainTimeoutMs,
         });
         if (txHash) {
-          const v = await verifyTxHash(txHash, order, goatRpc(), {
+          const v = await verifyTxHash(txHash, target, goatRpcs(), {
             chainTimeoutMs: LIMITS.chainTimeoutMs,
           });
           if (v.ok) {
-            await markPaid(order, { txHash, from: v.from, amountUnits: v.amount });
+            await markPaid(target, { txHash, from: v.from, amountUnits: v.amount });
+          } else {
+            log("payment_rejected", { orderId: target.id, txHash, reason: v.reason });
           }
         }
       } catch {
         // transient RPC failure; try again next tick
       }
     }
-    // Also retire expired orders.
+    // Retire expired orders.
     for (const o of store.orders.values()) {
       if (o.status === "awaiting_payment" && Date.now() >= Date.parse(o.expiresAt)) {
         o.status = "expired";
@@ -213,7 +228,7 @@ async function watchPayments() {
         log("order_expired", { orderId: o.id });
       }
     }
-    await sleep(WATCH_POLL_MS);
+    await sleep(LIMITS.watchPollMs);
   }
 }
 
@@ -329,12 +344,20 @@ async function handler(req, res) {
     if (!TXHASH_RE.test(txHash)) {
       return send(res, 400, { error: "txHash must be a 0x transaction hash" });
     }
-    if (store.txUsed(txHash)) {
-      return send(res, 409, { error: "this transaction was already used for another scan" });
+    const usedBy = [...store.orders.values()].find(
+      (o) => o.payment?.txHash && o.payment.txHash.toLowerCase() === txHash.toLowerCase()
+    );
+    if (usedBy) {
+      return send(res, 409, {
+        error:
+          "this transaction already paid for another scan on this page's payment address",
+        usedByOrderId: usedBy.id,
+        usedByStatus: usedBy.status,
+      });
     }
     let v;
     try {
-      v = await verifyTxHash(txHash, order, goatRpc(), {
+      v = await verifyTxHash(txHash, order, goatRpcs(), {
         chainTimeoutMs: LIMITS.chainTimeoutMs,
       });
     } catch (e) {
@@ -358,8 +381,8 @@ const server = http.createServer((req, res) => {
 });
 
 function startWorker() {
-  server.listen(WORKER_PORT, "127.0.0.1", () => {
-    log("worker_started", { port: WORKER_PORT, payTo: PAY.payTo });
+  server.listen(WORKER_PORT, WORKER_BIND, () => {
+    log("worker_started", { port: WORKER_PORT, bind: WORKER_BIND, payTo: PAY.payTo });
   });
   watchPayments().catch((e) => log("watcher_error", { error: String(e && e.message || e) }));
 }
@@ -373,7 +396,6 @@ export {
   handler,
   createOrder,
   markPaid,
-  runScan,
   publicOrder,
   store,
   log as workerLog,
