@@ -19,13 +19,13 @@ const RPC = process.env.GRIDSCORE_RPC_GOAT || "https://rpc.goat.network";
 const REGISTRY = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
 const AGENT_URI = "https://gridscore-ckay.vercel.app/agent.json";
 
-// The key lives in /root/.splitpot-test-wallet.json (mode 600) — the wallet
+// The key lives in /root/.gridscore-owner-wallet.json (mode 600) — the wallet
 // funded for testing, whose address doubles as the agent owner.
 let key;
 try {
-  key = JSON.parse(readFileSync(`${homedir()}/.splitpot-test-wallet.json`)).privateKey;
+  key = JSON.parse(readFileSync(`${homedir()}/.gridscore-owner-wallet.json`)).privateKey;
 } catch {
-  console.error("FAIL — no wallet file at ~/.splitpot-test-wallet.json");
+  console.error("FAIL — no wallet file at ~/.gridscore-owner-wallet.json");
   process.exit(1);
 }
 

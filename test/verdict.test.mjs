@@ -104,6 +104,21 @@ describe("template verdict", () => {
     expect(v.reasons.every((r) => /: \d+\/100 — /.test(r) || /Unknown|N\/A/.test(r))).toBe(true);
   });
 
+  it("includes a written summary that states what the data shows", () => {
+    const v = templateVerdict(computeBars([okChain()], NOW));
+    expect(typeof v.summary).toBe("string");
+    expect(v.summary.length).toBeGreaterThan(20);
+    expect(v.summary).toContain("chains");
+  });
+
+  it("the summary for an unreachable scan says so", () => {
+    const score = computeBars(
+      [{ status: "unknown", chain: "goat", chainName: "GOAT", chainId: 2345, reason: "timeout" }],
+      NOW
+    );
+    expect(templateVerdict(score).summary).toContain("No chain data");
+  });
+
   it("never uses the forbidden words", () => {
     for (const v of VERDICTS) {
       expect(/\b(safe|legit|guaranteed scam)\b/i.test(v)).toBe(false);
@@ -131,6 +146,7 @@ describe("agent verdict via the configured endpoint", () => {
               message: {
                 content: JSON.stringify({
                   verdict: "Test with dust only",
+                  summary: "An ordinary account with light activity on one chain and a thin balance.",
                   reasons: ["r1", "r2", "r3"],
                   notChecked: ["n1", "n2"],
                 }),

@@ -3,10 +3,10 @@ import { barList } from "./score.mjs";
 
 /**
  * The Agent verdict. Exactly one of four options, 3 reasons drawn from the
- * bars, 2 things not checked. The text comes from an OpenAI-compatible
- * chat-completions endpoint when configured; otherwise a template built
- * directly from the bars. The model only ever sees the bars JSON — it does
- * not invent chain numbers.
+ * bars, 2 things not checked, plus a short written report. The text comes
+ * from an OpenAI-compatible chat-completions endpoint when configured;
+ * otherwise a template built directly from the bars. The model only ever
+ * sees the bars JSON — it does not invent chain numbers.
  */
 
 export const VERDICTS = [
@@ -16,19 +16,20 @@ export const VERDICTS = [
   "Not enough data",
 ];
 
-const SYSTEM_PROMPT = `You are the verdict writer for Gridscore, an address screening tool.
+const SYSTEM_PROMPT = `You are the report writer for Gridscore, an address screening tool.
 You receive JSON with rule-based bars computed from public blockchain RPC data.
 
 Respond with JSON only, matching exactly:
-{"verdict": "...", "reasons": ["...", "...", "..."], "notChecked": ["...", "..."]}
+{"verdict": "...", "summary": "...", "reasons": ["...", "...", "..."], "notChecked": ["...", "..."]}
 
 Rules:
 - "verdict" must be EXACTLY one of: "Do not interact", "Test with dust only", "OK for small, known use", "Not enough data".
+- "summary" must be 2-3 plain sentences (under 55 words) that walk through what the data shows: what kind of address this is, what stands out, and what the reader should weigh. Calm, concrete, no fluff.
 - "reasons" must contain EXACTLY 3 short sentences. Each must reference a concrete bar value from the JSON you received. Never invent numbers that are not in the JSON.
 - "notChecked" must contain EXACTLY 2 short phrases for things Gridscore did not check.
 - Use "Not enough data" when most bars are "unknown" or "na".
 - Never use the words "safe", "legit", or "guaranteed scam". No public labels list exists in the data, so never claim a label.
-- Do not give financial advice. Plain, calm language.`;
+- Do not give financial advice. Plain, calm language. No emojis.`;
 
 /** Build the exact JSON payload handed to the verdict endpoint. */
 export function verdictInput(score) {
@@ -64,6 +65,13 @@ function cleanList(v, n) {
   return items.length === n ? items : null;
 }
 
+function cleanSummary(v) {
+  if (typeof v !== "string") return null;
+  const s = v.trim().replace(/\s+/g, " ");
+  if (s.length === 0 || s.length > 600) return null;
+  return s;
+}
+
 const BANNED = /\b(safe|legit|guaranteed scam)\b/i;
 
 function validateVerdict(parsed) {
@@ -72,9 +80,10 @@ function validateVerdict(parsed) {
   if (!VERDICTS.includes(verdict)) return null;
   const reasons = cleanList(parsed.reasons, 3);
   const notChecked = cleanList(parsed.notChecked, 2);
+  const summary = cleanSummary(parsed.summary);
   if (!reasons || !notChecked) return null;
-  if (BANNED.test(verdict) || reasons.some((r) => BANNED.test(r))) return null;
-  return { verdict, reasons, notChecked };
+  if (BANNED.test(verdict) || reasons.some((r) => BANNED.test(r)) || (summary && BANNED.test(summary))) return null;
+  return { verdict, summary, reasons, notChecked };
 }
 
 /** Call the configured chat-completions endpoint. Returns null on any failure. */
@@ -134,6 +143,27 @@ function pickVerdict(score) {
   return "OK for small, known use";
 }
 
+function templateSummary(score) {
+  const m = score.meta;
+  if (score.overall === "unknown" || m.dataBars === 0) {
+    return `No chain data could be observed for this address${m.unknownChains.length ? ` — ${m.unknownChains.join(", ")} did not answer` : ""}. Everything remains Unknown until a chain responds.`;
+  }
+  const active = m.chainsTotal - m.unknownChains.length;
+  const parts = [];
+  parts.push(
+    `Public data was read on ${m.chainsReachable} of ${m.chainsTotal} chains${m.unknownChains.length ? ` (${m.unknownChains.join(", ")} did not answer and are excluded)` : ""}.`
+  );
+  const list = barList(score).filter((b) => typeof b.score === "number");
+  const weakest = [...list].sort((a, b) => a.score - b.score).slice(0, 2);
+  parts.push(
+    weakest.length
+      ? `The weakest signals are ${weakest.map((b) => b.label.toLowerCase() + " (" + b.score + "/100)").join(" and ")}.`
+      : ""
+  );
+  parts.push(`Overall averages ${score.overall}/100 across the ${m.dataBars} bars that could be scored.`);
+  return parts.filter(Boolean).join(" ");
+}
+
 function templateReasons(score) {
   const list = barList(score)
     .filter((b) => typeof b.score === "number")
@@ -171,6 +201,7 @@ function templateNotChecked() {
 export function templateVerdict(score) {
   return {
     verdict: pickVerdict(score),
+    summary: templateSummary(score),
     reasons: templateReasons(score),
     notChecked: templateNotChecked(),
   };

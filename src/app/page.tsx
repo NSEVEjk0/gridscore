@@ -60,7 +60,7 @@ interface Order {
     overall: number | string;
     meta?: { chainsReachable?: number; unknownChains?: string[] };
     barList: BarEntry[];
-    verdict: { verdict: string; reasons: string[]; notChecked: string[]; source: string };
+    verdict: { verdict: string; summary?: string; reasons: string[]; notChecked: string[]; source: string };
     agent: { erc8004: { agentRegistry: string; agentId: string } };
     payment: { txHash: string | null };
   } | null;
@@ -410,6 +410,11 @@ function Report({ order, onRestart }: { order: Order; onRestart: () => void }) {
         <div className="verdict-source">
           Written from the twelve bars below — {r.verdict.source === "model" ? "composed by the agent" : "composed by rule"}
         </div>
+        {r.verdict.summary ? (
+          <p style={{ margin: "18px 0 0", color: "var(--mute)", fontSize: ".98rem", lineHeight: 1.65 }}>
+            {r.verdict.summary}
+          </p>
+        ) : null}
         <div className="overall-line">
           <span className="verdict-label" style={{ margin: 0 }}>Overall</span>
           <span className="overall-num">{overall ?? "—"}</span>

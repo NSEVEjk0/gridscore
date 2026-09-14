@@ -54,6 +54,7 @@ function agentReport(order) {
     meta: r.meta,
     verdict: {
       verdict: r.verdict.verdict,
+      summary: r.verdict.summary || null,
       reasons: r.verdict.reasons,
       notChecked: r.verdict.notChecked,
       source: r.verdict.source,
