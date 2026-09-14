@@ -14,6 +14,7 @@ const SCANNED = "0x" + "9f".repeat(20);
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CLAIM_TX = "0x" + "d".repeat(64);
+const AGENT_TX = "0x" + "e".repeat(64);
 
 function pad(addr) {
   return "0x000000000000000000000000" + addr.slice(2).toLowerCase();
@@ -23,6 +24,7 @@ function makeReq(method, path, body) {
   const req = new EventEmitter();
   req.method = method;
   req.url = path;
+  req.headers = {}; // Node always provides a headers object; the handler reads it
   if (body !== undefined) {
     queueMicrotask(() => {
       req.emit("data", JSON.stringify(body));
@@ -36,6 +38,10 @@ function makeReq(method, path, body) {
 
 // handler(req, res) — build a tiny res that captures the response.
 function call(method, path, body) {
+  return callWithHeaders(method, path, body, {});
+}
+
+function callWithHeaders(method, path, body, extraHeaders) {
   return new Promise((resolve) => {
     const res = {
       statusCode: 0,
@@ -43,14 +49,18 @@ function call(method, path, body) {
       body: "",
       writeHead(status, headers) {
         this.statusCode = status;
-        this.headers = headers;
+        this.headers = headers || {};
       },
       end(text) {
         this.body = text;
         resolve(res);
       },
     };
-    handler(makeReq(method, path, body), res);
+    const req = makeReq(method, path, body);
+    for (const [k, v] of Object.entries(extraHeaders)) {
+      req.headers = { ...(req.headers || {}), [k]: v };
+    }
+    handler(req, res);
   });
 }
 
@@ -225,5 +235,117 @@ describe("order lifecycle", () => {
     expect(body.ok).toBe(true);
     expect(body.payTo).toBe(PAY_TO);
     expect(body.priceUsd).toBe(0.75);
+  });
+});
+
+describe("agent API (x402 pay-per-call)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    stubFetch();
+  });
+
+  it("POST /v1/scan without payment answers 402 with the x402 descriptor", async () => {
+    const res = await call("POST", "/v1/scan", { address: SCANNED });
+    expect(res.statusCode).toBe(402);
+    expect(res.headers["WWW-Authenticate"] || res.headers["www-authenticate"]).toBe("x402");
+    const body = json(res);
+    expect(body.x402Version).toBe(1);
+    expect(body.accepts[0]).toMatchObject({
+      scheme: "erc20-direct",
+      network: "eip155:2345",
+      tokenSymbol: "USDC",
+      amount: "750000",
+      amountHuman: "0.75",
+      payTo: PAY_TO,
+    });
+    expect(body.resource).toContain("POST /v1/scan");
+    const orderHeader =
+      res.headers["X-Order-Id"] ?? res.headers["x-order-id"];
+    expect(typeof orderHeader).toBe("string");
+  });
+
+  it("GET /v1/scan is price discovery with the same 402 shape", async () => {
+    const res = await call("GET", "/v1/scan");
+    expect(res.statusCode).toBe(402);
+    expect(json(res).accepts[0].amount).toBe("750000");
+  });
+
+  it("rejects a bad address before anything else", async () => {
+    const res = await call("POST", "/v1/scan", { address: "nope" });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a malformed X-Payment header", async () => {
+    const res = await callWithHeaders("POST", "/v1/scan", { address: SCANNED }, {
+      "x-payment": "not-a-hash",
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("paid call with X-Payment starts the scan and returns a poll URL", async () => {
+    const res = await callWithHeaders("POST", "/v1/scan", { address: SCANNED }, {
+      "x-payment": AGENT_TX,
+    });
+    expect(res.statusCode).toBe(202);
+    const body = json(res);
+    expect(body.status).toBe("scanning");
+    expect(body.poll).toMatch(/^\/v1\/report\//);
+
+    // the same tx cannot pay twice
+    const reuse = await callWithHeaders("POST", "/v1/scan", { address: SCANNED }, {
+      "x-payment": AGENT_TX,
+    });
+    expect(reuse.statusCode).toBe(409);
+  });
+
+  it("GET /v1/tiers publishes the price and the agent identity", async () => {
+    const res = await call("GET", "/v1/tiers");
+    expect(res.statusCode).toBe(200);
+    const body = json(res);
+    expect(body.tiers[0]).toMatchObject({
+      name: "standard",
+      priceUsd: 0.75,
+      amount: "750000",
+      token: "USDC",
+      payTo: PAY_TO,
+    });
+    expect(body.agent.erc8004.agentRegistry).toMatch(/^eip155:2345:0x[0-9a-fA-F]{40}$/);
+  });
+
+  it("GET /v1/report/:id returns the agent report with goatTx and identity", async () => {
+    const res1 = await callWithHeaders("POST", "/v1/scan", { address: SCANNED }, {
+      "x-payment": AGENT_TX,
+    });
+    const { orderId } = json(res1);
+    const done = await waitForOrderDone(orderId);
+
+    const res = await call("GET", `/v1/report/${orderId}`);
+    expect(res.statusCode).toBe(200);
+    const report = json(res);
+    expect(report.goatTx).toBe(AGENT_TX);
+    expect(report.goatTxUrl).toContain("explorer.goat.network/tx/");
+    expect(report.payment.txHash).toBe(AGENT_TX);
+    expect(report.bars).toHaveLength(12);
+    expect(["Do not interact", "Test with dust only", "OK for small, known use", "Not enough data"])
+      .toContain(report.verdict.verdict);
+    expect(report.agent.erc8004.agentRegistry).toMatch(/^eip155:2345:0x[0-9a-fA-F]{40}$/);
+    expect("agentId" in report.agent.erc8004).toBe(true);
+    void done;
+  });
+
+  it("GET /v1/agent returns the ERC-8004 identity block", async () => {
+    const res = await call("GET", "/v1/agent");
+    expect(res.statusCode).toBe(200);
+    const body = json(res);
+    expect(body.erc8004.agentRegistry).toMatch(/^eip155:2345:/);
+    expect(body.erc8004.agentURI).toContain("agent.json");
+  });
+
+  it("report endpoint 404s for unknown orders and 402s for unpaid ones", async () => {
+    expect((await call("GET", "/v1/report/does_not_exist")).statusCode).toBe(404);
+    const created = json(await call("POST", "/order", { address: SCANNED }));
+    const res = await call("GET", `/v1/report/${created.orderId}`);
+    expect(res.statusCode).toBe(402);
+    expect(json(res).accepts[0].payTo).toBe(PAY_TO);
   });
 });

@@ -1,6 +1,6 @@
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { AGENT, CHAINS, LIMITS, PAY, WORKER_BIND, WORKER_PORT, goatRpcs } from "./env.mjs";
+import { AGENT, CHAINS, LIMITS, PAY, WORKER_BIND, WORKER_PORT, goatRpcs, priceInUnits } from "./env.mjs";
 import { rpcCall, scanAllChains } from "./chains.mjs";
 import { computeBars } from "./score.mjs";
 import { agentVerdict, templateVerdict } from "./verdict.mjs";
@@ -26,6 +26,53 @@ import { Store, newOrderId } from "./state.mjs";
  */
 
 const ORDER_TTL_MS = 2 * 60 * 60 * 1000; // unpaid orders expire after 2h
+
+/** The agent's ERC-8004 identity, per the GOAT AgentKit registration format. */
+function agentIdentity() {
+  return {
+    name: "Gridscore screening agent",
+    erc8004: {
+      agentRegistry: AGENT.registry,
+      agentId: AGENT.agentId ? Number(AGENT.agentId) : null,
+      agentURI: AGENT.agentUri,
+      registered: Boolean(AGENT.agentId),
+      note: AGENT.agentId
+        ? "Registered on the GOAT Network ERC-8004 IdentityRegistry"
+        : "Registration pending on-chain (registry id shown); the identity is verified once agentId is set",
+    },
+  };
+}
+
+/** The agent-API report shape: bars + verdict + payment proof + identity. */
+function agentReport(order) {
+  const r = order.report;
+  return {
+    orderId: order.id,
+    address: r.address,
+    overall: r.overall,
+    bars: r.barList,
+    meta: r.meta,
+    verdict: {
+      verdict: r.verdict.verdict,
+      reasons: r.verdict.reasons,
+      notChecked: r.verdict.notChecked,
+      source: r.verdict.source,
+    },
+    goatTx: order.payment.txHash,
+    goatTxUrl: order.payment.txHash
+      ? `${PAY.explorerTx}${order.payment.txHash}`
+      : null,
+    payment: {
+      network: `GOAT Mainnet (chain ${PAY.chainId})`,
+      token: "USDC",
+      amountUsd: PAY.priceUsd,
+      txHash: order.payment.txHash,
+    },
+    agent: agentIdentity(),
+    finishedAt: r.finishedAt,
+    durationMs: r.durationMs,
+  };
+}
 
 const store = new Store();
 const log = (event, data = {}) =>
@@ -278,16 +325,43 @@ function readJson(req) {
   });
 }
 
-function send(res, status, body) {
+function send(res, status, body, extraHeaders = {}) {
   const text = JSON.stringify(body);
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-Payment, X-PAYMENT",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    ...extraHeaders,
   });
   res.end(text);
+}
+
+/** The x402 payment descriptor for the agent API ( ThoughtProof /v1/check pattern). */
+function x402Descriptor(resource) {
+  const units = priceInUnits();
+  return {
+    x402Version: 1,
+    error: "X-Payment header required. Send the described payment and retry.",
+    accepts: [
+      {
+        scheme: "erc20-direct",
+        network: `eip155:${PAY.chainId}`,
+        networkName: "GOAT Mainnet",
+        chainId: PAY.chainId,
+        token: PAY.usdc,
+        tokenSymbol: "USDC",
+        decimals: PAY.usdcDecimals,
+        amount: units,
+        amountHuman: PAY.priceUsd.toFixed(2),
+        payTo: PAY.payTo,
+      },
+    ],
+    description: `Gridscore address screening: ${resource}`,
+    resource,
+    maxTimeoutSeconds: 120,
+  };
 }
 
 async function handler(req, res) {
@@ -324,6 +398,110 @@ async function handler(req, res) {
     const order = store.get(orderMatch[1]);
     if (!order) return send(res, 404, { error: "order not found" });
     return send(res, 200, publicOrder(order));
+  }
+
+  // ---- Agent API (x402 pay-per-call) ----
+  // POST /v1/scan {address} -> 402 with the payment descriptor when unpaid,
+  // or an order the caller can watch/pay. GET /v1/scan is price discovery,
+  // exactly like a 402-first endpoint.
+  if (url.pathname === "/v1/scan") {
+    if (req.method === "GET") {
+      return send(res, 402, x402Descriptor("POST /v1/scan"), {
+        "WWW-Authenticate": "x402",
+      });
+    }
+    if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (e) {
+      return send(res, 400, { error: e.message });
+    }
+    const address = String(body.address || "").trim();
+    if (!ADDRESS_RE.test(address)) {
+      return send(res, 400, { error: "address must be a 0x address" });
+    }
+
+    // X-Payment carries a GOAT tx hash that already paid for this call.
+    const paymentHeader = req.headers["x-payment"];
+    if (!paymentHeader) {
+      const order = await createOrder(address);
+      return send(res, 402, x402Descriptor("POST /v1/scan"), {
+        "WWW-Authenticate": "x402",
+        "X-Order-Id": order.id,
+      });
+    }
+
+    const txHash = String(paymentHeader).trim();
+    if (!TXHASH_RE.test(txHash)) {
+      return send(res, 400, { error: "X-Payment must be a 0x GOAT transaction hash" });
+    }
+    const usedBy = [...store.orders.values()].find(
+      (o) => o.payment?.txHash && o.payment.txHash.toLowerCase() === txHash.toLowerCase()
+    );
+    if (usedBy) {
+      return send(res, 409, {
+        error: "this transaction already paid for another scan",
+        orderId: usedBy.id,
+        status: usedBy.status,
+      });
+    }
+    const order = await createOrder(address);
+    let v;
+    try {
+      v = await verifyTxHash(txHash, order, goatRpcs(), {
+        chainTimeoutMs: LIMITS.chainTimeoutMs,
+      });
+    } catch (e) {
+      return send(res, 502, { error: `could not verify on GOAT RPC: ${e.message}` });
+    }
+    if (!v.ok) {
+      return send(res, 402, { error: v.reason, ...x402Descriptor("POST /v1/scan") });
+    }
+    await markPaid(order, { txHash, from: v.from, amountUnits: v.amount });
+    return send(res, 202, {
+      orderId: order.id,
+      status: "scanning",
+      poll: `/v1/report/${order.id}`,
+    });
+  }
+
+  // Price discovery for agents.
+  if (req.method === "GET" && url.pathname === "/v1/tiers") {
+    return send(res, 200, {
+      tiers: [
+        {
+          name: "standard",
+          priceUsd: PAY.priceUsd,
+          amount: priceInUnits(),
+          token: "USDC",
+          chainId: PAY.chainId,
+          payTo: PAY.payTo,
+          includes: "12 rule-based bars, agent verdict, payment receipt (goatTx)",
+        },
+      ],
+      agent: agentIdentity(),
+    });
+  }
+
+  // Fetch a finished (or in-progress) report by order id.
+  const agentReportMatch = url.pathname.match(/^\/v1\/report\/([a-z0-9_]+)$/);
+  if (req.method === "GET" && agentReportMatch) {
+    const order = store.get(agentReportMatch[1]);
+    if (!order) return send(res, 404, { error: "order not found" });
+    if (order.status === "awaiting_payment" || order.status === "expired") {
+      return send(res, 402, x402Descriptor("POST /v1/scan"));
+    }
+    if (order.status !== "done") {
+      return send(res, 202, { orderId: order.id, status: "scanning" });
+    }
+    return send(res, 200, agentReport(order));
+  }
+
+  // The agent's ERC-8004 identity, for callers that want it inline.
+  if (req.method === "GET" && url.pathname === "/v1/agent") {
+    return send(res, 200, agentIdentity());
   }
 
   const claimMatch = url.pathname.match(/^\/order\/([a-z0-9_]+)\/claim$/);

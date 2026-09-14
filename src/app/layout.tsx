@@ -38,6 +38,7 @@ export default function RootLayout({
               Gridscore
             </a>
             <nav>
+              <a href="/history">History</a>
               <a href={X_URL} target="_blank" rel="noreferrer">
                 X
               </a>

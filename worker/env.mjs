@@ -95,7 +95,8 @@ export const AGENT = {
     "GRIDSCORE_ERC8004_REGISTRY",
     "eip155:2345:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
   ),
-  agentId: env("GRIDSCORE_ERC8004_AGENT_ID", "1"),
+  agentId: env("GRIDSCORE_ERC8004_AGENT_ID", ""),
+  agentUri: env("GRIDSCORE_ERC8004_AGENT_URI", "https://gridscore-ckay.vercel.app/agent.json"),
 };
 
 export const WORKER_PORT = Number(env("GRIDSCORE_PORT", "8787"));

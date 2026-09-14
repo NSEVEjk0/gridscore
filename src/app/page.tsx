@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { BackButton } from "@/components/BackButton";
+import { recordOutcome, recordScan } from "@/lib/history";
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const TXHASH_RE = /^0x[0-9a-fA-F]{64}$/;
@@ -107,10 +109,16 @@ export default function HomePage() {
 
   const applyOrder = useCallback((o: Order) => {
     setOrder(o);
-    if (typeof window !== "undefined") localStorage.setItem(ORDER_KEY, o.orderId);
+    if (typeof window !== "undefined") {
+      localStorage.setItem(ORDER_KEY, o.orderId);
+      recordScan(o.orderId, o.address);
+    }
     if (o.status === "awaiting_payment") setPhase("pay");
     if (o.status === "scanning") setPhase("scan");
-    if (o.status === "done" && o.report) setPhase("done");
+    if (o.status === "done" && o.report) {
+      recordOutcome(o.orderId, o.report.overall, o.report.verdict.verdict);
+      setPhase("done");
+    }
     if (o.status === "expired") {
       localStorage.removeItem(ORDER_KEY);
       setError("That order expired unpaid. Start a new scan below.");
@@ -228,8 +236,7 @@ export default function HomePage() {
           <p className="kicker">Address screening</p>
           <h1>
             Know an address before you send funds or approve a contract.
-          </h1>
-          <p className="lead">
+          </h1>          <p className="lead">
             Gridscore reads public chain data on eight networks, scores twelve
             bars with fixed rules, and gives one agent verdict. One scan costs
             $0.75 USDC, paid on GOAT Network.
@@ -274,6 +281,7 @@ export default function HomePage() {
 
       {phase === "pay" && order && accept ? (
         <>
+          <BackButton />
           <p className="step-tag">Step 2 · Pay on GOAT</p>
           <h1>Send the payment</h1>
           <p className="lead">
@@ -339,6 +347,7 @@ export default function HomePage() {
 
       {phase === "scan" && order ? (
         <>
+          <BackButton />
           <p className="step-tag">Step 3 · Scanning</p>
           <h1>Reading the chains</h1>
           <p className="lead mono" style={{ wordBreak: "break-all" }}>{order.address}</p>
@@ -391,6 +400,7 @@ function Report({ order, onRestart }: { order: Order; onRestart: () => void }) {
 
   return (
     <>
+      <BackButton />
       <p className="step-tag">Step 4 · Report</p>
       <div className="verdict-box">
         <div className="verdict-label">Agent verdict</div>

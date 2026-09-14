@@ -1,0 +1,32 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+  "name": "Gridscore screening agent",
+  "description": "Scans a 0x address across eight public chains and returns twelve rule-based bars plus an agent verdict. Pay per scan in USDC on GOAT Network.",
+  "image": "https://gridscore-ckay.vercel.app/icon.svg",
+  "services": [
+    {
+      "name": "x402",
+      "endpoint": "https://gridscore-ckay.vercel.app/api/agent/v1/scan",
+      "version": "1.0.0"
+    },
+    {
+      "name": "tiers",
+      "endpoint": "https://gridscore-ckay.vercel.app/api/agent/v1/tiers",
+      "version": "1.0.0"
+    },
+    {
+      "name": "report",
+      "endpoint": "https://gridscore-ckay.vercel.app/api/agent/v1/report/{orderId}",
+      "version": "1.0.0"
+    }
+  ],
+  "x402Support": true,
+  "active": true,
+  "registrations": [
+    {
+      "agentRegistry": "eip155:2345:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+      "agentId": 0
+    }
+  ],
+  "supportedTrust": ["reputation"]
+}

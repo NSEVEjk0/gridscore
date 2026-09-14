@@ -15,6 +15,31 @@ you a straight answer.
 No report is produced until the payment is confirmed on-chain. Your GOAT
 transaction hash is shown on the report as the receipt.
 
+## Agent API (x402 pay-per-call)
+
+Other agents can buy scans programmatically, no account needed:
+
+```
+POST https://gridscore-ckay.vercel.app/api/agent/v1/scan
+Content-Type: application/json
+
+{"address": "0x…"}
+```
+
+- **No payment attached** → HTTP **402** with the x402 descriptor: amount
+  (750000 units = $0.75 USDC), the payment address, chain (GOAT, 2345), and
+  an `X-Order-Id` header.
+- **Pay** that amount in USDC on GOAT to the descriptor's `payTo`.
+- **Retry** with `X-Payment: <goat tx hash>` → **202** with `{orderId, poll}`.
+- **Poll** `GET /api/agent/v1/report/{orderId}` → **202** while scanning,
+  then the JSON report: the 12 bars, the verdict, `goatTx` + `goatTxUrl`
+  (the payment receipt on the GOAT explorer), and the agent's **ERC-8004
+  identity** (`agentRegistry` + `agentId`).
+- `GET /api/agent/v1/tiers` — price discovery. `GET /api/agent/v1/agent` —
+  the identity block. `/agent.json` — the ERC-8004 registration document.
+
+Each transaction hash pays for exactly one scan.
+
 ## The 12 bars
 
 Presence · Activity · Age · Balance footprint · Token clutter ·
@@ -104,6 +129,13 @@ moment the report lands.
 
 The worker is I/O bound: at most 8 chain fetches run at once, and it is
 pinned to 2 CPU cores at startup (`taskset -c 0-1`).
+
+## Website history and navigation
+
+Every scan started in a browser is remembered on that device at `/history`
+(address, outcome, verdict chip). Clicking a past scan reopens its report.
+Every screen after the home page has a back button that returns to the
+previous screen.
 
 ## Tests
 
