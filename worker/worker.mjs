@@ -5,6 +5,7 @@ import { rpcCall, scanAllChains } from "./chains.mjs";
 import { computeBars } from "./score.mjs";
 import { agentVerdict, templateVerdict } from "./verdict.mjs";
 import { challenge, detectPayment, verifyTxHash } from "./payments.mjs";
+import { createFlowOrder, flowConfigured, flowIsPaid, getFlowOrderStatus } from "./goatflow.mjs";
 import { Store, newOrderId } from "./state.mjs";
 
 /**
@@ -68,6 +69,7 @@ function agentReport(order) {
       token: "USDC",
       amountUsd: PAY.priceUsd,
       txHash: order.payment.txHash,
+      flowOrderId: order.payment.flowOrderId || null,
     },
     agent: agentIdentity(),
     finishedAt: r.finishedAt,
@@ -215,14 +217,15 @@ export async function runScan(order) {
   });
 }
 
-async function markPaid(order, { txHash, from, amountUnits }) {
+async function markPaid(order, { txHash, from, amountUnits, flowOrderId }) {
   if (order.status !== "awaiting_payment") return;
   order.payment.paidAt = new Date().toISOString();
   order.payment.txHash = txHash;
   order.payment.from = from;
   order.payment.amountUnits = amountUnits;
+  if (flowOrderId) order.payment.flowOrderId = flowOrderId;
   store.put(order);
-  log("payment_confirmed", { orderId: order.id, txHash });
+  log("payment_confirmed", { orderId: order.id, txHash, flowOrderId: flowOrderId || null });
   // Fire and forget — the client polls order status.
   runScan(order).catch((err) => {
     log("scan_error", { orderId: order.id, error: String(err && err.message || err) });
@@ -245,10 +248,37 @@ async function markPaid(order, { txHash, from, amountUnits }) {
   });
 }
 
-// ---- Payment watcher: poll GOAT for incoming USDC on unpaid orders ----
+// ---- Payment watcher: poll GOAT Flow orders and raw USDC transfers ----
 async function watchPayments() {
   for (;;) {
-    const target = pickOrderForPayment([...store.orders.values()]);
+    const orders = [...store.orders.values()];
+    const active = orders.filter(
+      (o) => o.status === "awaiting_payment" && Date.now() < Date.parse(o.expiresAt)
+    );
+
+    // Official Flow rail: every unpaid order has its own Flow order id
+    // (bound via dapp_order_id at creation), so each is polled.
+    if (flowConfigured()) {
+      for (const o of active) {
+        if (!o.payment?.flowOrderId) continue;
+        try {
+          const state = await getFlowOrderStatus(o.payment.flowOrderId);
+          if (flowIsPaid(state.status)) {
+            await markPaid(o, {
+              txHash: state.txHash || o.payment.flowOrderId,
+              from: null,
+              amountUnits: null,
+              flowOrderId: o.payment.flowOrderId,
+            });
+          }
+        } catch {
+          // transient Flow API failure; try again next tick
+        }
+      }
+    }
+
+    // ERC20-direct rail: an incoming transfer attaches to the newest unpaid order.
+    const target = pickOrderForPayment(orders);
     if (target) {
       try {
         const txHash = await detectPayment(target, goatRpcs(), store.usedTxHashes, {
@@ -269,7 +299,7 @@ async function watchPayments() {
       }
     }
     // Retire expired orders.
-    for (const o of store.orders.values()) {
+    for (const o of orders) {
       if (o.status === "awaiting_payment" && Date.now() >= Date.parse(o.expiresAt)) {
         o.status = "expired";
         store.put(o);
@@ -339,28 +369,44 @@ function send(res, status, body, extraHeaders = {}) {
   res.end(text);
 }
 
-/** The x402 payment descriptor for the agent API ( ThoughtProof /v1/check pattern). */
+/** The x402 payment descriptor for the agent API, in the official wire
+ *  format from the GOATNetwork/x402 API reference (x402Version 2, resource
+ *  object, accepts[] with asset + extra), plus convenience fields agents
+ *  already use (networkName, amountHuman, decimals). */
 function x402Descriptor(resource) {
   const units = priceInUnits();
   return {
-    x402Version: 1,
-    error: "X-Payment header required. Send the described payment and retry.",
+    x402Version: 2,
+    error: "X-Payment required. Send the described payment and retry.",
+    resource: {
+      url: resource,
+      description: `Gridscore address screening: ${resource}`,
+      mimeType: "application/json",
+    },
     accepts: [
       {
         scheme: "erc20-direct",
         network: `eip155:${PAY.chainId}`,
+        amount: units,
+        asset: {
+          address: PAY.usdc,
+          symbol: "USDC",
+          decimals: PAY.usdcDecimals,
+          chainId: PAY.chainId,
+        },
+        payTo: PAY.payTo,
+        maxTimeoutSeconds: 120,
+        extra: { flow: "ERC20_DIRECT", tokenSymbol: "USDC" },
+        // convenience aliases
         networkName: "GOAT Mainnet",
         chainId: PAY.chainId,
         token: PAY.usdc,
         tokenSymbol: "USDC",
         decimals: PAY.usdcDecimals,
-        amount: units,
         amountHuman: PAY.priceUsd.toFixed(2),
-        payTo: PAY.payTo,
       },
     ],
     description: `Gridscore address screening: ${resource}`,
-    resource,
     maxTimeoutSeconds: 120,
   };
 }
@@ -424,20 +470,77 @@ async function handler(req, res) {
       return send(res, 400, { error: "address must be a 0x address" });
     }
 
-    // X-Payment carries a GOAT tx hash that already paid for this call.
+    // X-Payment carries either a GOAT tx hash that already paid for this
+    // call (erc20-direct) or a GOAT Flow order id (official Flow rail).
     const paymentHeader = req.headers["x-payment"];
     if (!paymentHeader) {
       const order = await createOrder(address);
+      // Official GOAT Flow rail first, when merchant credentials exist.
+      if (flowConfigured()) {
+        try {
+          const flowOrder = await createFlowOrder({
+            dappOrderId: order.id,
+            fromAddress: body.fromAddress,
+          });
+          order.payment.flowOrderId = flowOrder.orderId;
+          store.put(order);
+          log("flow_order_created", { orderId: order.id, flowOrderId: flowOrder.orderId });
+          return send(
+            res,
+            402,
+            { ...flowOrder.challenge, order_id: flowOrder.orderId },
+            { "WWW-Authenticate": "x402", "X-Order-Id": order.id }
+          );
+        } catch (err) {
+          log("flow_order_failed", {
+            orderId: order.id,
+            error: String(err && err.message || err).slice(0, 150),
+          });
+          // fall through to the documented erc20-direct challenge
+        }
+      }
       return send(res, 402, x402Descriptor("POST /v1/scan"), {
         "WWW-Authenticate": "x402",
         "X-Order-Id": order.id,
       });
     }
 
-    const txHash = String(paymentHeader).trim();
-    if (!TXHASH_RE.test(txHash)) {
-      return send(res, 400, { error: "X-Payment must be a 0x GOAT transaction hash" });
+    const paymentRef = String(paymentHeader).trim();
+    // A GOAT Flow order id: check the official order status.
+    if (!/^0x[0-9a-fA-F]{64}$/.test(paymentRef)) {
+      if (!flowConfigured()) {
+        return send(res, 400, {
+          error: "X-Payment must be a 0x GOAT transaction hash (Flow rail not configured)",
+        });
+      }
+      let state;
+      try {
+        state = await getFlowOrderStatus(paymentRef);
+      } catch (e) {
+        return send(res, 502, { error: `could not check Flow order: ${e.message}` });
+      }
+      if (!flowIsPaid(state.status)) {
+        return send(res, 402, {
+          error: `Flow order not settled yet (status ${state.status})`,
+          ...x402Descriptor("POST /v1/scan"),
+        });
+      }
+      const order = await createOrder(address);
+      order.payment.flowOrderId = paymentRef;
+      await markPaid(order, {
+        txHash: state.txHash || paymentRef,
+        from: null,
+        amountUnits: null,
+        flowOrderId: paymentRef,
+      });
+      return send(res, 202, {
+        orderId: order.id,
+        status: "scanning",
+        poll: `/v1/report/${order.id}`,
+      });
     }
+
+    const txHash = paymentRef;
     const usedBy = [...store.orders.values()].find(
       (o) => o.payment?.txHash && o.payment.txHash.toLowerCase() === txHash.toLowerCase()
     );
@@ -495,7 +598,25 @@ async function handler(req, res) {
       return send(res, 402, x402Descriptor("POST /v1/scan"));
     }
     if (order.status !== "done") {
-      return send(res, 202, { orderId: order.id, status: "scanning" });
+      // Poll the Flow order once so completed payments flip promptly.
+      if (order.payment?.flowOrderId && flowConfigured()) {
+        try {
+          const state = await getFlowOrderStatus(order.payment.flowOrderId);
+          if (flowIsPaid(state.status)) {
+            await markPaid(order, {
+              txHash: state.txHash || order.payment.flowOrderId,
+              from: null,
+              amountUnits: null,
+              flowOrderId: order.payment.flowOrderId,
+            });
+          }
+        } catch {
+          // transient; watcher retries
+        }
+      }
+      if (order.status !== "done") {
+        return send(res, 202, { orderId: order.id, status: "scanning" });
+      }
     }
     return send(res, 200, agentReport(order));
   }

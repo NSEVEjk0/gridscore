@@ -60,7 +60,21 @@ export function goatRpcs() {
   return CHAINS.find((c) => c.key === "goat").rpcs;
 }
 
-// GOAT Network payment rails (x402-style ERC20 direct transfer).
+// GOAT Network payment rails. The primary rail is the official GOAT Flow
+// x402 API (https://github.com/GOATNetwork/x402); configure it with
+// GOATX402_API_URL / GOATX402_API_KEY / GOATX402_API_SECRET from the
+// merchant portal (https://flow-merchant.goat.network). Without those
+// credentials the worker serves the documented ERC20_DIRECT challenge and
+// verifies payments on-chain by GOAT transaction hash.
+export function flowConfig() {
+  return {
+    baseUrl: (process.env.GOATX402_API_URL || "https://flow-api.goat.network").replace(/\/+$/, ""),
+    apiKey: process.env.GOATX402_API_KEY || "",
+    apiSecret: process.env.GOATX402_API_SECRET || "",
+  };
+}
+
+// Direct on-chain rail (fallback, and the payee for Flow when configured).
 export const PAY = {
   network: "goat-mainnet",
   chainId: 2345,

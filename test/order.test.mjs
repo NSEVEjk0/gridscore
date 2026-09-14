@@ -249,16 +249,25 @@ describe("agent API (x402 pay-per-call)", () => {
     expect(res.statusCode).toBe(402);
     expect(res.headers["WWW-Authenticate"] || res.headers["www-authenticate"]).toBe("x402");
     const body = json(res);
-    expect(body.x402Version).toBe(1);
+    // official wire format from the GOATNetwork/x402 API reference
+    expect(body.x402Version).toBe(2);
+    expect(body.resource.url).toContain("POST /v1/scan");
     expect(body.accepts[0]).toMatchObject({
       scheme: "erc20-direct",
       network: "eip155:2345",
-      tokenSymbol: "USDC",
       amount: "750000",
-      amountHuman: "0.75",
       payTo: PAY_TO,
+      maxTimeoutSeconds: 120,
     });
-    expect(body.resource).toContain("POST /v1/scan");
+    expect(body.accepts[0].asset).toMatchObject({
+      symbol: "USDC",
+      decimals: 6,
+      chainId: 2345,
+    });
+    expect(body.accepts[0].extra).toMatchObject({ flow: "ERC20_DIRECT", tokenSymbol: "USDC" });
+    // convenience fields agents use
+    expect(body.accepts[0].amountHuman).toBe("0.75");
+    expect(body.accepts[0].networkName).toBe("GOAT Mainnet");
     const orderHeader =
       res.headers["X-Order-Id"] ?? res.headers["x-order-id"];
     expect(typeof orderHeader).toBe("string");
